@@ -4,6 +4,6 @@
 const YOUTUBE_API_KEY = "AIzaSyB_9HWgybMj9LtxC4s8xSLrPQjIKEQlyDg";
 
 // 2. Your playlist's ID (steps to find it are in README.md, Step 1)
-const PLAYLIST_ID = "PLJ3M6AoVR-gZtOkB4v-_XgzYQz_6UQssJ";
+const PLAYLIST_ID = "PLxzEzcNbKPvpG4WYueOxxVOpOz8CrU9yn";
 
 module.exports = { YOUTUBE_API_KEY, PLAYLIST_ID };
