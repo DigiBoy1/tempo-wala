@@ -97,12 +97,19 @@ function currentSyncPayload() {
       videoId: state.adhocVideo.videoId,
       title: state.adhocVideo.title,
       elapsed: currentElapsedSeconds(),
+      upNextTitle: null,
     };
   }
   const list = playlistCache[state.playlistKey] || [];
   if (list.length === 0) return null;
   const track = list[state.trackIndex % list.length];
-  return { videoId: track.videoId, title: track.title, elapsed: currentElapsedSeconds() };
+  const next = list[(state.trackIndex + 1) % list.length];
+  return {
+    videoId: track.videoId,
+    title: track.title,
+    elapsed: currentElapsedSeconds(),
+    upNextTitle: next ? next.title : null,
+  };
 }
 
 function broadcastSync() {
@@ -144,6 +151,22 @@ function scheduleNext() {
     broadcastSync();
     scheduleNext();
   }, Math.max(msLeft, 1000));
+}
+
+// Admin-triggered change: waits 10s (so it feels intentional, not jarring) and
+// tells everyone what's coming up next before it actually switches.
+function scheduleAdminChange(key, index) {
+  const list = playlistCache[key] || [];
+  if (list.length === 0) return;
+  const safeIndex = ((index % list.length) + list.length) % list.length;
+  const track = list[safeIndex];
+
+  clearMainTimer();
+  io.emit("upNext", { title: track.title, seconds: 10 });
+
+  mainTimer = setTimeout(() => {
+    playPlaylistTrack(key, safeIndex, 0);
+  }, 10000);
 }
 
 function playAdhoc(videoId, title, durationSeconds) {
@@ -200,7 +223,27 @@ io.on("connection", (socket) => {
   socket.on("adminSwitchPlaylist", async (key) => {
     if (socket.id !== adminSocketId) return;
     if (!playlistCache[key]) await loadPlaylist(key);
-    playPlaylistTrack(key, 0, 0);
+    const list = playlistCache[key] || [];
+    socket.emit("playlistSongs", {
+      key,
+      songs: list.map((t, i) => ({ index: i, title: t.title })),
+    });
+  });
+
+  socket.on("adminPlaySong", (data) => {
+    if (socket.id !== adminSocketId) return;
+    if (state.mode !== "playlist" && !playlistCache[data.key]) return;
+    scheduleAdminChange(data.key, data.index);
+  });
+
+  socket.on("adminNext", () => {
+    if (socket.id !== adminSocketId || state.mode !== "playlist") return;
+    scheduleAdminChange(state.playlistKey, state.trackIndex + 1);
+  });
+
+  socket.on("adminPrev", () => {
+    if (socket.id !== adminSocketId || state.mode !== "playlist") return;
+    scheduleAdminChange(state.playlistKey, state.trackIndex - 1);
   });
 
   socket.on("adminPlayLink", async (url) => {
@@ -225,7 +268,7 @@ io.on("connection", (socket) => {
     if (!text || !text.trim()) return;
     const entry = { id: Date.now(), text: text.trim().slice(0, 200), time: new Date().toLocaleTimeString() };
     requestQueue.push(entry);
-    if (requestQueue.length > 50) requestQueue.shift();
+    if (requestQueue.length > 5) requestQueue.shift();
     io.to(adminSocketId).emit("newRequest", entry);
   });
 
@@ -251,6 +294,16 @@ io.on("connection", (socket) => {
 })();
 
 setInterval(loadAllPlaylists, 10 * 60 * 1000);
+
+// Continuous drift-correction — every 15s, tell everyone exactly where playback
+// should be right now. Clients that have drifted just quietly snap back into
+// place instead of reloading the whole video.
+setInterval(() => {
+  const payload = currentSyncPayload();
+  if (payload) {
+    io.emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
+  }
+}, 15000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
