@@ -97,6 +97,7 @@ function currentSyncPayload() {
       videoId: state.adhocVideo.videoId,
       title: state.adhocVideo.title,
       elapsed: currentElapsedSeconds(),
+      duration: state.adhocVideo.durationSeconds,
       upNextTitle: null,
     };
   }
@@ -108,6 +109,7 @@ function currentSyncPayload() {
     videoId: track.videoId,
     title: track.title,
     elapsed: currentElapsedSeconds(),
+    duration: track.durationSeconds,
     upNextTitle: next ? next.title : null,
   };
 }
@@ -169,7 +171,8 @@ function scheduleAdminChange(key, index) {
   }, 10000);
 }
 
-function playAdhoc(videoId, title, durationSeconds) {
+function playAdhoc(videoId, title, durationSeconds, startAt) {
+  startAt = startAt || 0;
   if (state.mode === "playlist") {
     state.resume = {
       playlistKey: state.playlistKey,
@@ -179,14 +182,15 @@ function playAdhoc(videoId, title, durationSeconds) {
   }
   state.mode = "adhoc";
   state.adhocVideo = { videoId, title, durationSeconds };
-  state.trackStartedAt = Date.now();
+  state.trackStartedAt = Date.now() - startAt * 1000;
   clearMainTimer();
   broadcastSync();
 
+  var remaining = Math.max(durationSeconds - startAt, 1);
   mainTimer = setTimeout(() => {
     const r = state.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
     playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed);
-  }, Math.max(durationSeconds * 1000, 1000));
+  }, remaining * 1000);
 }
 
 // ---- Live user count + admin session ----
@@ -246,18 +250,41 @@ io.on("connection", (socket) => {
     scheduleAdminChange(state.playlistKey, state.trackIndex - 1);
   });
 
-  socket.on("adminPlayLink", async (url) => {
+  // Jump to a specific point within the CURRENT song (drag/tap the timeline)
+  socket.on("adminSeek", (seconds) => {
     if (socket.id !== adminSocketId) return;
+    seconds = Math.max(0, Math.floor(seconds || 0));
+    state.trackStartedAt = Date.now() - seconds * 1000;
+    clearMainTimer();
+
+    const payload = currentSyncPayload();
+    if (payload) io.emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
+
+    if (state.mode === "playlist") {
+      scheduleNext();
+    } else if (state.mode === "adhoc" && state.adhocVideo) {
+      const remaining = Math.max(state.adhocVideo.durationSeconds - seconds, 1);
+      mainTimer = setTimeout(() => {
+        const r = state.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
+        playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed);
+      }, remaining * 1000);
+    }
+  });
+
+  socket.on("adminPlayLink", async (data) => {
+    if (socket.id !== adminSocketId) return;
+    var url = typeof data === "string" ? data : data.url;
+    var startAt = typeof data === "object" && data.startSeconds ? data.startSeconds : 0;
     const videoId = extractVideoId(url);
     if (!videoId) return;
     try {
       const infoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
       const res = await fetch(infoUrl);
-      const data = await res.json();
-      if (!data.items || data.items.length === 0) return;
-      const item = data.items[0];
+      const data2 = await res.json();
+      if (!data2.items || data2.items.length === 0) return;
+      const item = data2.items[0];
       const duration = parseDuration(item.contentDetails.duration);
-      playAdhoc(videoId, item.snippet.title, duration);
+      playAdhoc(videoId, item.snippet.title, duration, startAt);
     } catch (err) {
       console.error("adminPlayLink error:", err.message);
     }
