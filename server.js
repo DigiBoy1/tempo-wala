@@ -33,6 +33,22 @@ function extractVideoId(url) {
   return null;
 }
 
+// Fetches title + duration for a videoId, then plays it (used by both
+// "paste a link" and "search results" features)
+async function playVideoById(videoId, startAt) {
+  try {
+    const infoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
+    const res = await fetch(infoUrl);
+    const data = await res.json();
+    if (!data.items || data.items.length === 0) return;
+    const item = data.items[0];
+    const duration = parseDuration(item.contentDetails.duration);
+    playAdhoc(videoId, item.snippet.title, duration, startAt || 0);
+  } catch (err) {
+    console.error("playVideoById error:", err.message);
+  }
+}
+
 async function loadPlaylist(key) {
   const meta = PLAYLISTS.find((p) => p.key === key);
   if (!meta || !meta.playlistId) return [];
@@ -197,6 +213,18 @@ function playAdhoc(videoId, title, durationSeconds, startAt) {
 let userCount = 0;
 let adminSocketId = null;
 let requestQueue = [];
+let searchCount = 0;
+let searchCountDate = new Date().toDateString();
+
+function bumpSearchCount() {
+  const today = new Date().toDateString();
+  if (today !== searchCountDate) {
+    searchCountDate = today;
+    searchCount = 0;
+  }
+  searchCount++;
+  return searchCount;
+}
 
 io.on("connection", (socket) => {
   userCount++;
@@ -220,6 +248,7 @@ io.on("connection", (socket) => {
       playlists: PLAYLISTS.filter((p) => p.playlistId).map((p) => ({ key: p.key, name: p.name })),
       requests: requestQueue,
       currentPlaylistKey: state.playlistKey,
+      searchCount: searchCount,
     });
     io.emit("adminStatus", { online: true });
   });
@@ -277,17 +306,37 @@ io.on("connection", (socket) => {
     var startAt = typeof data === "object" && data.startSeconds ? data.startSeconds : 0;
     const videoId = extractVideoId(url);
     if (!videoId) return;
+    await playVideoById(videoId, startAt);
+  });
+
+  // Search YouTube by song name — returns up to 5 results for admin to pick from
+  socket.on("adminSearch", async (query) => {
+    if (socket.id !== adminSocketId) return;
+    if (!query || !query.trim()) return;
     try {
-      const infoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
-      const res = await fetch(infoUrl);
-      const data2 = await res.json();
-      if (!data2.items || data2.items.length === 0) return;
-      const item = data2.items[0];
-      const duration = parseDuration(item.contentDetails.duration);
-      playAdhoc(videoId, item.snippet.title, duration, startAt);
+      const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=6&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
+      const res = await fetch(searchUrl);
+      const data = await res.json();
+      const count = bumpSearchCount();
+      if (!data.items) {
+        socket.emit("searchResults", { results: [], searchCount: count });
+        return;
+      }
+      const results = data.items.map((item) => ({
+        videoId: item.id.videoId,
+        title: item.snippet.title,
+        thumbnail: item.snippet.thumbnails.default.url,
+      }));
+      socket.emit("searchResults", { results, searchCount: count });
     } catch (err) {
-      console.error("adminPlayLink error:", err.message);
+      console.error("adminSearch error:", err.message);
+      socket.emit("searchResults", { results: [], searchCount: searchCount });
     }
+  });
+
+  socket.on("adminPlaySearchResult", async (videoId) => {
+    if (socket.id !== adminSocketId) return;
+    await playVideoById(videoId, 0);
   });
 
   socket.on("songRequest", (text) => {
