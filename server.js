@@ -146,6 +146,7 @@ function currentElapsedSeconds(roomState) {
 }
 
 function currentSyncPayload(roomState) {
+  var count = roomState.listeners ? roomState.listeners.size : 0;
   if (roomState.mode === "adhoc" && roomState.adhocVideo) {
     return {
       videoId: roomState.adhocVideo.videoId,
@@ -153,6 +154,7 @@ function currentSyncPayload(roomState) {
       elapsed: currentElapsedSeconds(roomState),
       duration: roomState.adhocVideo.durationSeconds,
       upNextTitle: null,
+      roomListeners: count
     };
   }
   const list = playlistCache[roomState.playlistKey] || [];
@@ -165,6 +167,7 @@ function currentSyncPayload(roomState) {
     elapsed: currentElapsedSeconds(roomState),
     duration: track.durationSeconds,
     upNextTitle: next ? next.title : null,
+    roomListeners: count
   };
 }
 
