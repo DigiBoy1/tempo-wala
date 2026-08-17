@@ -1,4 +1,4 @@
-// server.js — synced radio + admin controls + song requests
+// server.js — synced radio + admin controls + song requests + custom rooms
 
 const express = require("express");
 const http = require("http");
@@ -21,7 +21,7 @@ app.get("/", (req, res) => {
 });
 
 // ---- Playlist storage ----
-let playlistCache = {}; // key -> array of { videoId, durationSeconds, title }
+let playlistCache = {}; 
 
 function parseDuration(iso) {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -40,9 +40,7 @@ function extractVideoId(url) {
   return null;
 }
 
-// Fetches title + duration for a videoId, then plays it (used by both
-// "paste a link" and "search results" features)
-async function playVideoById(videoId, startAt) {
+async function playVideoById(videoId, startAt, roomCode) {
   try {
     const infoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
     const res = await fetch(infoUrl);
@@ -50,7 +48,7 @@ async function playVideoById(videoId, startAt) {
     if (!data.items || data.items.length === 0) return;
     const item = data.items[0];
     const duration = parseDuration(item.contentDetails.duration);
-    playAdhoc(videoId, item.snippet.title, duration, startAt || 0);
+    playAdhoc(videoId, item.snippet.title, duration, startAt || 0, roomCode);
   } catch (err) {
     console.error("playVideoById error:", err.message);
   }
@@ -92,134 +90,28 @@ async function loadAllPlaylists() {
 }
 
 // ---- Shared playback state ----
-let state = {
-  mode: "playlist", // "playlist" | "adhoc"
-  playlistKey: PLAYLISTS[0].key,
-  trackIndex: 0,
-  trackStartedAt: Date.now(),
-  adhocVideo: null, // { videoId, title, durationSeconds }
-  resume: null, // { playlistKey, trackIndex, elapsed } — saved when an adhoc link starts playing
-};
+const MAX_CUSTOM_ROOMS = 10;
+const rooms = new Map();
 
-let mainTimer = null;
-
-function clearMainTimer() {
-  if (mainTimer) {
-    clearTimeout(mainTimer);
-    mainTimer = null;
-  }
-}
-
-function currentElapsedSeconds() {
-  return Math.floor((Date.now() - state.trackStartedAt) / 1000);
-}
-
-function currentSyncPayload() {
-  if (state.mode === "adhoc" && state.adhocVideo) {
-    return {
-      videoId: state.adhocVideo.videoId,
-      title: state.adhocVideo.title,
-      elapsed: currentElapsedSeconds(),
-      duration: state.adhocVideo.durationSeconds,
-      upNextTitle: null,
-    };
-  }
-  const list = playlistCache[state.playlistKey] || [];
-  if (list.length === 0) return null;
-  const track = list[state.trackIndex % list.length];
-  const next = list[(state.trackIndex + 1) % list.length];
+function createRoomState(adminId = null) {
   return {
-    videoId: track.videoId,
-    title: track.title,
-    elapsed: currentElapsedSeconds(),
-    duration: track.durationSeconds,
-    upNextTitle: next ? next.title : null,
+    mode: "playlist", // "playlist" | "adhoc"
+    playlistKey: PLAYLISTS[0].key,
+    trackIndex: 0,
+    trackStartedAt: Date.now(),
+    adhocVideo: null, // { videoId, title, durationSeconds }
+    resume: null, // { playlistKey, trackIndex, elapsed }
+    mainTimer: null,
+    adminSocketId: adminId, // For custom rooms
+    listeners: new Set(),
+    requestQueue: []
   };
 }
 
-function broadcastSync() {
-  const payload = currentSyncPayload();
-  if (payload) io.emit("sync", payload);
-}
+// Initialize main room
+rooms.set("main", createRoomState());
 
-function playPlaylistTrack(key, index, elapsedOverride) {
-  state.mode = "playlist";
-  state.playlistKey = key;
-  state.trackIndex = index;
-  state.trackStartedAt = Date.now() - (elapsedOverride || 0) * 1000;
-  clearMainTimer();
-  broadcastSync();
-  scheduleNext();
-}
-
-function scheduleNext() {
-  clearMainTimer();
-  if (state.mode !== "playlist") return;
-
-  const list = playlistCache[state.playlistKey] || [];
-  if (list.length === 0) {
-    mainTimer = setTimeout(scheduleNext, 5000);
-    return;
-  }
-  const track = list[state.trackIndex % list.length];
-  const msLeft = track.durationSeconds * 1000 - (Date.now() - state.trackStartedAt);
-
-  mainTimer = setTimeout(() => {
-    if (state.mode !== "playlist") return;
-    const freshList = playlistCache[state.playlistKey] || [];
-    if (freshList.length === 0) {
-      scheduleNext();
-      return;
-    }
-    state.trackIndex = (state.trackIndex + 1) % freshList.length;
-    state.trackStartedAt = Date.now();
-    broadcastSync();
-    scheduleNext();
-  }, Math.max(msLeft, 1000));
-}
-
-// Admin-triggered change: waits 10s (so it feels intentional, not jarring) and
-// tells everyone what's coming up next before it actually switches.
-function scheduleAdminChange(key, index) {
-  const list = playlistCache[key] || [];
-  if (list.length === 0) return;
-  const safeIndex = ((index % list.length) + list.length) % list.length;
-  const track = list[safeIndex];
-
-  clearMainTimer();
-  io.emit("upNext", { title: track.title, seconds: 10 });
-
-  mainTimer = setTimeout(() => {
-    playPlaylistTrack(key, safeIndex, 0);
-  }, 10000);
-}
-
-function playAdhoc(videoId, title, durationSeconds, startAt) {
-  startAt = startAt || 0;
-  if (state.mode === "playlist") {
-    state.resume = {
-      playlistKey: state.playlistKey,
-      trackIndex: state.trackIndex,
-      elapsed: currentElapsedSeconds(),
-    };
-  }
-  state.mode = "adhoc";
-  state.adhocVideo = { videoId, title, durationSeconds };
-  state.trackStartedAt = Date.now() - startAt * 1000;
-  clearMainTimer();
-  broadcastSync();
-
-  var remaining = Math.max(durationSeconds - startAt, 1);
-  mainTimer = setTimeout(() => {
-    const r = state.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
-    playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed);
-  }, remaining * 1000);
-}
-
-// ---- Live user count + admin session ----
-let userCount = 0;
-let adminSocketId = null;
-let requestQueue = [];
+// Global search count
 let searchCount = 0;
 let searchCountDate = new Date().toDateString();
 
@@ -233,35 +125,275 @@ function bumpSearchCount() {
   return searchCount;
 }
 
-io.on("connection", (socket) => {
-  userCount++;
-  io.emit("userCount", userCount);
+// Generate random room code
+function generateRoomCode() {
+  let code;
+  do {
+    code = Math.floor(1000 + Math.random() * 9000).toString();
+  } while (rooms.has(code));
+  return code;
+}
 
-  const payload = currentSyncPayload();
+function clearMainTimer(roomState) {
+  if (roomState.mainTimer) {
+    clearTimeout(roomState.mainTimer);
+    roomState.mainTimer = null;
+  }
+}
+
+function currentElapsedSeconds(roomState) {
+  return Math.floor((Date.now() - roomState.trackStartedAt) / 1000);
+}
+
+function currentSyncPayload(roomState) {
+  if (roomState.mode === "adhoc" && roomState.adhocVideo) {
+    return {
+      videoId: roomState.adhocVideo.videoId,
+      title: roomState.adhocVideo.title,
+      elapsed: currentElapsedSeconds(roomState),
+      duration: roomState.adhocVideo.durationSeconds,
+      upNextTitle: null,
+    };
+  }
+  const list = playlistCache[roomState.playlistKey] || [];
+  if (list.length === 0) return null;
+  const track = list[roomState.trackIndex % list.length];
+  const next = list[(roomState.trackIndex + 1) % list.length];
+  return {
+    videoId: track.videoId,
+    title: track.title,
+    elapsed: currentElapsedSeconds(roomState),
+    duration: track.durationSeconds,
+    upNextTitle: next ? next.title : null,
+  };
+}
+
+function broadcastSync(roomCode) {
+  const roomState = rooms.get(roomCode);
+  if (!roomState) return;
+  const payload = currentSyncPayload(roomState);
+  if (payload) io.to(roomCode).emit("sync", payload);
+}
+
+function playPlaylistTrack(key, index, elapsedOverride, roomCode) {
+  const roomState = rooms.get(roomCode);
+  if (!roomState) return;
+  roomState.mode = "playlist";
+  roomState.playlistKey = key;
+  roomState.trackIndex = index;
+  roomState.trackStartedAt = Date.now() - (elapsedOverride || 0) * 1000;
+  clearMainTimer(roomState);
+  broadcastSync(roomCode);
+  scheduleNext(roomCode);
+}
+
+function scheduleNext(roomCode) {
+  const roomState = rooms.get(roomCode);
+  if (!roomState) return;
+  clearMainTimer(roomState);
+  if (roomState.mode !== "playlist") return;
+
+  const list = playlistCache[roomState.playlistKey] || [];
+  if (list.length === 0) {
+    roomState.mainTimer = setTimeout(() => scheduleNext(roomCode), 5000);
+    return;
+  }
+  const track = list[roomState.trackIndex % list.length];
+  const msLeft = track.durationSeconds * 1000 - (Date.now() - roomState.trackStartedAt);
+
+  roomState.mainTimer = setTimeout(() => {
+    const freshRoomState = rooms.get(roomCode);
+    if (!freshRoomState || freshRoomState.mode !== "playlist") return;
+    const freshList = playlistCache[freshRoomState.playlistKey] || [];
+    if (freshList.length === 0) {
+      scheduleNext(roomCode);
+      return;
+    }
+    freshRoomState.trackIndex = (freshRoomState.trackIndex + 1) % freshList.length;
+    freshRoomState.trackStartedAt = Date.now();
+    broadcastSync(roomCode);
+    scheduleNext(roomCode);
+  }, Math.max(msLeft, 1000));
+}
+
+function scheduleAdminChange(key, index, roomCode) {
+  const roomState = rooms.get(roomCode);
+  if (!roomState) return;
+  const list = playlistCache[key] || [];
+  if (list.length === 0) return;
+  const safeIndex = ((index % list.length) + list.length) % list.length;
+  const track = list[safeIndex];
+
+  clearMainTimer(roomState);
+  io.to(roomCode).emit("upNext", { title: track.title, seconds: 10 });
+
+  roomState.mainTimer = setTimeout(() => {
+    playPlaylistTrack(key, safeIndex, 0, roomCode);
+  }, 10000);
+}
+
+function playAdhoc(videoId, title, durationSeconds, startAt, roomCode) {
+  const roomState = rooms.get(roomCode);
+  if (!roomState) return;
+  startAt = startAt || 0;
+  if (roomState.mode === "playlist") {
+    roomState.resume = {
+      playlistKey: roomState.playlistKey,
+      trackIndex: roomState.trackIndex,
+      elapsed: currentElapsedSeconds(roomState),
+    };
+  }
+  roomState.mode = "adhoc";
+  roomState.adhocVideo = { videoId, title, durationSeconds };
+  roomState.trackStartedAt = Date.now() - startAt * 1000;
+  clearMainTimer(roomState);
+  broadcastSync(roomCode);
+
+  var remaining = Math.max(durationSeconds - startAt, 1);
+  roomState.mainTimer = setTimeout(() => {
+    const rs = rooms.get(roomCode);
+    if (!rs) return;
+    const r = rs.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
+    playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed, roomCode);
+  }, remaining * 1000);
+}
+
+// ---- Live user count + global admin logic ----
+let globalUserCount = 0;
+let globalAdminSocketId = null;
+
+io.on("connection", (socket) => {
+  // Ping listener to measure latency
+  socket.on("pingTime", (clientTime) => {
+    socket.emit("pongTime", { clientTime, serverTime: Date.now() });
+  });
+
+  globalUserCount++;
+  io.emit("userCount", globalUserCount);
+
+  let currentRoom = "main";
+  socket.join("main");
+  rooms.get("main").listeners.add(socket.id);
+
+  const payload = currentSyncPayload(rooms.get("main"));
   if (payload) socket.emit("sync", payload);
-  socket.emit("adminStatus", { online: !!adminSocketId });
+  socket.emit("adminStatus", { online: !!globalAdminSocketId || rooms.get("main").adminSocketId === socket.id, isGlobal: !!globalAdminSocketId });
+  socket.emit("roomJoined", "main");
+
+  function isAdmin() {
+    return socket.id === globalAdminSocketId || (rooms.has(currentRoom) && rooms.get(currentRoom).adminSocketId === socket.id);
+  }
+
+  socket.on("createRoom", () => {
+    if (rooms.size >= MAX_CUSTOM_ROOMS + 1) {
+      return socket.emit("roomError", "Maximum number of rooms reached (10).");
+    }
+    const code = generateRoomCode();
+    rooms.set(code, createRoomState(socket.id));
+    
+    leaveCurrentRoom();
+    currentRoom = code;
+    socket.join(code);
+    rooms.get(code).listeners.add(socket.id);
+
+    scheduleNext(code);
+    
+    socket.emit("roomCreated", code);
+    const rp = currentSyncPayload(rooms.get(code));
+    if (rp) socket.emit("sync", rp);
+    
+    socket.emit("adminLoginResult", {
+      success: true,
+      playlists: PLAYLISTS.filter((p) => p.playlistId).map((p) => ({ key: p.key, name: p.name })),
+      requests: rooms.get(code).requestQueue,
+      currentPlaylistKey: rooms.get(code).playlistKey,
+      searchCount: searchCount,
+      roomCode: code
+    });
+    io.to(code).emit("adminStatus", { online: true, isGlobal: false });
+  });
+
+  socket.on("joinRoom", (code) => {
+    if (!rooms.has(code)) {
+      return socket.emit("roomError", "Room not found.");
+    }
+    leaveCurrentRoom();
+    currentRoom = code;
+    socket.join(code);
+    const rs = rooms.get(code);
+    rs.listeners.add(socket.id);
+    
+    socket.emit("roomJoined", code);
+    const rp = currentSyncPayload(rs);
+    if (rp) socket.emit("sync", rp);
+    socket.emit("adminStatus", { online: !!rs.adminSocketId || !!globalAdminSocketId, isGlobal: false });
+  });
+
+  socket.on("leaveRoom", () => {
+    leaveCurrentRoom();
+    currentRoom = "main";
+    socket.join("main");
+    rooms.get("main").listeners.add(socket.id);
+    socket.emit("roomJoined", "main");
+    const rp = currentSyncPayload(rooms.get("main"));
+    if (rp) socket.emit("sync", rp);
+  });
+
+  function leaveCurrentRoom() {
+    if (currentRoom !== "main" && rooms.has(currentRoom)) {
+      const rs = rooms.get(currentRoom);
+      rs.listeners.delete(socket.id);
+      socket.leave(currentRoom);
+      
+      if (rs.adminSocketId === socket.id) {
+        destroyRoom(currentRoom);
+      }
+    } else if (currentRoom === "main") {
+      rooms.get("main").listeners.delete(socket.id);
+      socket.leave("main");
+    }
+  }
+
+  function destroyRoom(code) {
+    if (code === "main" || !rooms.has(code)) return;
+    const rs = rooms.get(code);
+    clearMainTimer(rs);
+    io.to(code).emit("roomDestroyed", "Room admin has left. Returning to main radio.");
+    rooms.delete(code);
+  }
 
   socket.on("adminLogin", (password) => {
     if (password !== ADMIN_PASSWORD) {
       socket.emit("adminLoginResult", { success: false });
       return;
     }
-    if (adminSocketId && adminSocketId !== socket.id) {
-      io.to(adminSocketId).emit("adminDemoted");
+    if (globalAdminSocketId && globalAdminSocketId !== socket.id) {
+      io.to(globalAdminSocketId).emit("adminDemoted");
     }
-    adminSocketId = socket.id;
+    globalAdminSocketId = socket.id;
+    rooms.get("main").adminSocketId = socket.id;
+    if (currentRoom !== "main") {
+      leaveCurrentRoom();
+      currentRoom = "main";
+      socket.join("main");
+      rooms.get("main").listeners.add(socket.id);
+      socket.emit("roomJoined", "main");
+    }
+    
+    const rs = rooms.get("main");
     socket.emit("adminLoginResult", {
       success: true,
       playlists: PLAYLISTS.filter((p) => p.playlistId).map((p) => ({ key: p.key, name: p.name })),
-      requests: requestQueue,
-      currentPlaylistKey: state.playlistKey,
+      requests: rs.requestQueue,
+      currentPlaylistKey: rs.playlistKey,
       searchCount: searchCount,
+      roomCode: "main"
     });
-    io.emit("adminStatus", { online: true });
+    io.to("main").emit("adminStatus", { online: true, isGlobal: true });
   });
 
   socket.on("adminSwitchPlaylist", async (key) => {
-    if (socket.id !== adminSocketId) return;
+    if (!isAdmin()) return;
     if (!playlistCache[key]) await loadPlaylist(key);
     const list = playlistCache[key] || [];
     socket.emit("playlistSongs", {
@@ -271,54 +403,60 @@ io.on("connection", (socket) => {
   });
 
   socket.on("adminPlaySong", (data) => {
-    if (socket.id !== adminSocketId) return;
-    if (state.mode !== "playlist" && !playlistCache[data.key]) return;
-    scheduleAdminChange(data.key, data.index);
+    if (!isAdmin()) return;
+    const rs = rooms.get(currentRoom);
+    if (rs.mode !== "playlist" && !playlistCache[data.key]) return;
+    scheduleAdminChange(data.key, data.index, currentRoom);
   });
 
   socket.on("adminNext", () => {
-    if (socket.id !== adminSocketId || state.mode !== "playlist") return;
-    scheduleAdminChange(state.playlistKey, state.trackIndex + 1);
+    if (!isAdmin()) return;
+    const rs = rooms.get(currentRoom);
+    if (rs.mode !== "playlist") return;
+    scheduleAdminChange(rs.playlistKey, rs.trackIndex + 1, currentRoom);
   });
 
   socket.on("adminPrev", () => {
-    if (socket.id !== adminSocketId || state.mode !== "playlist") return;
-    scheduleAdminChange(state.playlistKey, state.trackIndex - 1);
+    if (!isAdmin()) return;
+    const rs = rooms.get(currentRoom);
+    if (rs.mode !== "playlist") return;
+    scheduleAdminChange(rs.playlistKey, rs.trackIndex - 1, currentRoom);
   });
 
-  // Jump to a specific point within the CURRENT song (drag/tap the timeline)
   socket.on("adminSeek", (seconds) => {
-    if (socket.id !== adminSocketId) return;
+    if (!isAdmin()) return;
+    const rs = rooms.get(currentRoom);
     seconds = Math.max(0, Math.floor(seconds || 0));
-    state.trackStartedAt = Date.now() - seconds * 1000;
-    clearMainTimer();
+    rs.trackStartedAt = Date.now() - seconds * 1000;
+    clearMainTimer(rs);
 
-    const payload = currentSyncPayload();
-    if (payload) io.emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
+    const payload = currentSyncPayload(rs);
+    if (payload) io.to(currentRoom).emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
 
-    if (state.mode === "playlist") {
-      scheduleNext();
-    } else if (state.mode === "adhoc" && state.adhocVideo) {
-      const remaining = Math.max(state.adhocVideo.durationSeconds - seconds, 1);
-      mainTimer = setTimeout(() => {
-        const r = state.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
-        playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed);
+    if (rs.mode === "playlist") {
+      scheduleNext(currentRoom);
+    } else if (rs.mode === "adhoc" && rs.adhocVideo) {
+      const remaining = Math.max(rs.adhocVideo.durationSeconds - seconds, 1);
+      rs.mainTimer = setTimeout(() => {
+        const freshRs = rooms.get(currentRoom);
+        if (!freshRs) return;
+        const r = freshRs.resume || { playlistKey: PLAYLISTS[0].key, trackIndex: 0, elapsed: 0 };
+        playPlaylistTrack(r.playlistKey, r.trackIndex, r.elapsed, currentRoom);
       }, remaining * 1000);
     }
   });
 
   socket.on("adminPlayLink", async (data) => {
-    if (socket.id !== adminSocketId) return;
+    if (!isAdmin()) return;
     var url = typeof data === "string" ? data : data.url;
     var startAt = typeof data === "object" && data.startSeconds ? data.startSeconds : 0;
     const videoId = extractVideoId(url);
     if (!videoId) return;
-    await playVideoById(videoId, startAt);
+    await playVideoById(videoId, startAt, currentRoom);
   });
 
-  // Search YouTube by song name — returns up to 5 results for admin to pick from
   socket.on("adminSearch", async (query) => {
-    if (socket.id !== adminSocketId) return;
+    if (!isAdmin()) return;
     if (!query || !query.trim()) return;
     try {
       const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=6&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
@@ -342,30 +480,36 @@ io.on("connection", (socket) => {
   });
 
   socket.on("adminPlaySearchResult", async (videoId) => {
-    if (socket.id !== adminSocketId) return;
-    await playVideoById(videoId, 0);
+    if (!isAdmin()) return;
+    await playVideoById(videoId, 0, currentRoom);
   });
 
   socket.on("songRequest", (text) => {
-    if (!adminSocketId) return; // requests only allowed while admin is online
+    const rs = rooms.get(currentRoom);
+    if (!rs || !rs.adminSocketId) return; // requests only allowed if room has an admin
     if (!text || !text.trim()) return;
     const entry = { id: Date.now(), text: text.trim().slice(0, 200), time: new Date().toLocaleTimeString() };
-    requestQueue.push(entry);
-    if (requestQueue.length > 5) requestQueue.shift();
-    io.to(adminSocketId).emit("newRequest", entry);
+    rs.requestQueue.push(entry);
+    if (rs.requestQueue.length > 5) rs.requestQueue.shift();
+    io.to(rs.adminSocketId).emit("newRequest", entry);
   });
 
   socket.on("adminClearRequests", () => {
-    if (socket.id !== adminSocketId) return;
-    requestQueue = [];
+    if (!isAdmin()) return;
+    const rs = rooms.get(currentRoom);
+    if (rs) rs.requestQueue = [];
   });
 
   socket.on("disconnect", () => {
-    userCount--;
-    io.emit("userCount", userCount);
-    if (socket.id === adminSocketId) {
-      adminSocketId = null;
-      io.emit("adminStatus", { online: false });
+    globalUserCount--;
+    io.emit("userCount", globalUserCount);
+    leaveCurrentRoom();
+    if (socket.id === globalAdminSocketId) {
+      globalAdminSocketId = null;
+      if (rooms.has("main")) {
+        rooms.get("main").adminSocketId = null;
+        io.to("main").emit("adminStatus", { online: false, isGlobal: false });
+      }
     }
   });
 });
@@ -373,18 +517,18 @@ io.on("connection", (socket) => {
 // ---- Startup ----
 (async () => {
   await loadAllPlaylists();
-  scheduleNext();
+  scheduleNext("main");
 })();
 
 setInterval(loadAllPlaylists, 10 * 60 * 1000);
 
-// Continuous drift-correction — every 15s, tell everyone exactly where playback
-// should be right now. Clients that have drifted just quietly snap back into
-// place instead of reloading the whole video.
+// Continuous drift-correction per room
 setInterval(() => {
-  const payload = currentSyncPayload();
-  if (payload) {
-    io.emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
+  for (const [roomCode, rs] of rooms.entries()) {
+    const payload = currentSyncPayload(rs);
+    if (payload) {
+      io.to(roomCode).emit("resync", { videoId: payload.videoId, elapsed: payload.elapsed });
+    }
   }
 }, 15000);
 
