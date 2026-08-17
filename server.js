@@ -9,6 +9,13 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+const https = require("https");
+setInterval(() => {
+  https.get("https://tempo-wala.onrender.com").on('error', (err) => {
+    console.log("Self-ping failed:", err.message);
+  });
+}, 14 * 60 * 1000); // Ping every 14 minutes to prevent sleep
+
 app.get("/", (req, res) => {
   res.send("Backend is running. This URL is only for the server, not the website itself.");
 });
